@@ -12,6 +12,8 @@ import 'package:intl/intl.dart';
 import 'package:http/http.dart' as http;
 import 'package:record/record.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
+import 'package:speech_to_text/speech_to_text.dart';
 import 'package:uuid/uuid.dart';
 
 void main() {
@@ -19,6 +21,7 @@ void main() {
 }
 
 const openAIApiKey = String.fromEnvironment('OPENAI_API_KEY');
+const backendDiarizationUrl = String.fromEnvironment('BACKEND_DIARIZATION_URL');
 const _secureApiKeyStorageKey = 'openai_api_key';
 
 class SecureApiKeyStore {
@@ -40,6 +43,14 @@ class SpeechTranscriptionService {
     required String apiKey,
   }) async {
     final safePath = await prepareAudioFileForUpload(audioPath);
+    final backendText = await _tryBackendDiarization(
+      safePath: safePath,
+      languageCode: languageCode,
+    );
+    if (backendText != null && backendText.trim().isNotEmpty) {
+      return backendText;
+    }
+
     final diarized = await _tryDiarizedTranscription(
       safePath: safePath,
       languageCode: languageCode,
@@ -72,6 +83,30 @@ class SpeechTranscriptionService {
       if (text.isNotEmpty) return text;
     }
     throw Exception('Resposta de transcrição inválida.');
+  }
+
+  Future<String?> _tryBackendDiarization({
+    required String safePath,
+    required String languageCode,
+  }) async {
+    if (backendDiarizationUrl.trim().isEmpty) return null;
+    try {
+      final lang = _mapLanguage(languageCode);
+      final uri = Uri.parse('$backendDiarizationUrl/diarize-transcribe?language=$lang');
+      final request = http.MultipartRequest('POST', uri)
+        ..files.add(await http.MultipartFile.fromPath('file', safePath));
+      final streamed = await request.send().timeout(const Duration(minutes: 5));
+      final body = await streamed.stream.bytesToString();
+      if (streamed.statusCode < 200 || streamed.statusCode >= 300) return null;
+      final decoded = jsonDecode(body);
+      if (decoded is Map<String, dynamic>) {
+        final text = decoded['text']?.toString().trim() ?? '';
+        if (text.isNotEmpty) return text;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<String?> _tryDiarizedTranscription({
@@ -374,6 +409,7 @@ class GlassCard extends StatelessWidget {
 }
 
 enum TranscriptionSource { recorded, imported }
+enum TranscriptionEngine { cloud, onDeviceLive }
 
 class TranscriptionItem {
   TranscriptionItem({
@@ -565,6 +601,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                             title: result.files.single.name,
                             language: 'pt-BR',
                             source: TranscriptionSource.imported,
+                            engine: TranscriptionEngine.cloud,
+                            onDeviceTranscript: '',
                             durationHint: const Duration(minutes: 1),
                           ),
                         ),
@@ -690,17 +728,22 @@ class RecordingScreen extends StatefulWidget {
 
 class _RecordingScreenState extends State<RecordingScreen> {
   final _audioRecorder = AudioRecorder();
+  final _speechToText = SpeechToText();
   final _languages = const ['pt-BR', 'en-US', 'es-ES'];
   String _language = 'pt-BR';
+  TranscriptionEngine _engine = TranscriptionEngine.onDeviceLive;
   bool _recording = false;
   bool _paused = false;
   Duration _elapsed = Duration.zero;
   Timer? _timer;
   String? _path;
+  String _livePartial = '';
+  final List<String> _liveSegments = [];
 
   @override
   void dispose() {
     _timer?.cancel();
+    _speechToText.stop();
     _audioRecorder.dispose();
     super.dispose();
   }
@@ -717,6 +760,10 @@ class _RecordingScreenState extends State<RecordingScreen> {
       path: outputPath,
     );
 
+    if (_engine == TranscriptionEngine.onDeviceLive) {
+      await _startLiveRecognition();
+    }
+
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       setState(() => _elapsed += const Duration(seconds: 1));
@@ -726,18 +773,50 @@ class _RecordingScreenState extends State<RecordingScreen> {
       _recording = true;
       _paused = false;
       _elapsed = Duration.zero;
+      _livePartial = '';
+      _liveSegments.clear();
     });
+  }
+
+  Future<void> _startLiveRecognition() async {
+    final ok = await _speechToText.initialize();
+    if (!ok) return;
+
+    await _speechToText.listen(
+      localeId: _language,
+      listenOptions: SpeechListenOptions(
+        listenMode: ListenMode.dictation,
+        partialResults: true,
+      ),
+      onResult: _onSpeechResult,
+    );
+  }
+
+  void _onSpeechResult(SpeechRecognitionResult result) {
+    if (!mounted) return;
+    setState(() => _livePartial = result.recognizedWords);
+    if (result.finalResult && result.recognizedWords.trim().isNotEmpty) {
+      final ts = _formatDuration(_elapsed);
+      _liveSegments.add('[$ts] Locutor 1: ${result.recognizedWords.trim()}');
+      setState(() => _livePartial = '');
+    }
   }
 
   Future<void> _pauseOrResume() async {
     await HapticFeedback.selectionClick();
     if (_paused) {
       await _audioRecorder.resume();
+      if (_engine == TranscriptionEngine.onDeviceLive) {
+        await _startLiveRecognition();
+      }
       _timer = Timer.periodic(const Duration(seconds: 1), (_) {
         setState(() => _elapsed += const Duration(seconds: 1));
       });
     } else {
       await _audioRecorder.pause();
+      if (_engine == TranscriptionEngine.onDeviceLive) {
+        await _speechToText.stop();
+      }
       _timer?.cancel();
     }
     setState(() => _paused = !_paused);
@@ -746,6 +825,7 @@ class _RecordingScreenState extends State<RecordingScreen> {
   Future<void> _cancel() async {
     await HapticFeedback.lightImpact();
     _timer?.cancel();
+    await _speechToText.stop();
     await _audioRecorder.stop();
     if (!mounted) return;
     Navigator.of(context).pop();
@@ -754,6 +834,7 @@ class _RecordingScreenState extends State<RecordingScreen> {
   Future<void> _finish() async {
     await HapticFeedback.heavyImpact();
     _timer?.cancel();
+    await _speechToText.stop();
     _path = await _audioRecorder.stop();
     if (!mounted || _path == null) return;
 
@@ -764,6 +845,11 @@ class _RecordingScreenState extends State<RecordingScreen> {
           title: 'Gravação ${DateFormat('dd/MM HH:mm').format(DateTime.now())}',
           language: _language,
           source: TranscriptionSource.recorded,
+          engine: _engine,
+          onDeviceTranscript: [
+            ..._liveSegments,
+            if (_livePartial.trim().isNotEmpty) '[${_formatDuration(_elapsed)}] Locutor 1: ${_livePartial.trim()}',
+          ].join('\n').trim(),
           durationHint: _elapsed,
         ),
       ),
@@ -827,6 +913,37 @@ class _RecordingScreenState extends State<RecordingScreen> {
                 decoration: const InputDecoration(labelText: 'Idioma da transcrição'),
               ),
             ),
+            const SizedBox(height: 10),
+            GlassCard(
+              child: DropdownButtonFormField<TranscriptionEngine>(
+                initialValue: _engine,
+                items: const [
+                  DropdownMenuItem(
+                    value: TranscriptionEngine.onDeviceLive,
+                    child: Text('On-device (ao vivo)'),
+                  ),
+                  DropdownMenuItem(
+                    value: TranscriptionEngine.cloud,
+                    child: Text('Cloud (API)'),
+                  ),
+                ],
+                onChanged: (v) => setState(() => _engine = v ?? TranscriptionEngine.onDeviceLive),
+                decoration: const InputDecoration(labelText: 'Motor de transcrição'),
+              ),
+            ),
+            if (_engine == TranscriptionEngine.onDeviceLive && _recording) ...[
+              const SizedBox(height: 10),
+              GlassCard(
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    _livePartial.isEmpty ? 'Escutando fala ao vivo...' : _livePartial,
+                    maxLines: 4,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ),
+            ],
             const Spacer(),
             if (!_recording)
               SizedBox(
@@ -880,6 +997,8 @@ class TranscribingScreen extends ConsumerStatefulWidget {
     required this.title,
     required this.language,
     required this.source,
+    required this.engine,
+    required this.onDeviceTranscript,
     required this.durationHint,
   });
 
@@ -887,6 +1006,8 @@ class TranscribingScreen extends ConsumerStatefulWidget {
   final String title;
   final String language;
   final TranscriptionSource source;
+  final TranscriptionEngine engine;
+  final String onDeviceTranscript;
   final Duration durationHint;
 
   @override
@@ -914,6 +1035,42 @@ class _TranscribingScreenState extends ConsumerState<TranscribingScreen> {
       partial = '';
       progress = 0;
     });
+
+    if (widget.engine == TranscriptionEngine.onDeviceLive) {
+      final localText = widget.onDeviceTranscript.trim();
+      if (localText.isEmpty) {
+        setState(() {
+          _errorMessage = 'Nenhuma fala detectada no modo on-device. Tente novamente com áudio mais claro.';
+        });
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 450));
+      if (!mounted) return;
+      setState(() {
+        progress = 1;
+        partial = localText;
+      });
+      final id = const Uuid().v4();
+      ref.read(historyProvider.notifier).add(
+            TranscriptionItem(
+              id: id,
+              title: widget.title,
+              text: localText,
+              createdAt: DateTime.now(),
+              duration: widget.durationHint,
+              language: widget.language,
+              source: widget.source,
+              confidence: 0.86,
+              audioPath: widget.audioPath,
+            ),
+          );
+      if (!mounted) return;
+      Navigator.of(context).pushAndRemoveUntil(
+        buildCinematicRoute(TranscriptionDetailScreen(itemId: id)),
+        (route) => route.isFirst,
+      );
+      return;
+    }
 
     final apiKey = await _resolveApiKey();
     if (apiKey == null || apiKey.trim().isEmpty) {
